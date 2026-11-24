@@ -497,11 +497,21 @@ export class Transport {
             "urn:proofline:sdk:timeout",
             "the review wait deadline expired",
           );
-        throw new ProoflineError(
+        const lost = new ProoflineError(
           0,
           "urn:proofline:sdk:transport",
           "the request did not receive a response within its timeout",
         );
+        // A read that lost its connection before any response is safe to send again.
+        // A request that ran out its own timeout, and every mutation, keeps one attempt.
+        if (method !== "GET" || signal.aborted || attempt >= MAX_RETRIES)
+          throw lost;
+        const delay = Math.min(2 ** attempt, MAX_RETRY_SECONDS) * 1000;
+        // An unreachable server must not look like a review that is still running.
+        if (deadline !== undefined && performance.now() + delay >= deadline)
+          throw lost;
+        await sleep(delay);
+        continue;
       }
       if (mcpPhase && response.ok) {
         const notification = mcpPhase === "notification";

@@ -606,6 +606,112 @@ test("reads honor bounded Retry-After and mutations make one attempt", async (t)
   }
 });
 
+test("reads retry a lost connection within the retry budget and mutations make one attempt", async (t) => {
+  const attempts = new Map();
+  const fixture = await server(t, (request, response) => {
+    const key = `${request.method} ${request.url}`;
+    const count = (attempts.get(key) ?? 0) + 1;
+    attempts.set(key, count);
+    if (request.url.includes("hanging")) return;
+    const drops = request.url.includes("flaky") ? 2 : Number.POSITIVE_INFINITY;
+    if (count <= drops) return response.destroy();
+    return json(response, 200, { id: "flaky", detail: responseCanary });
+  });
+  const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
+  const callsTo = (fragment) =>
+    fixture.calls.filter((call) => call.url.includes(fragment));
+  const lost = (error) =>
+    error instanceof ProoflineError &&
+    error.status === 0 &&
+    error.type === "urn:proofline:sdk:transport" &&
+    error.detail ===
+      "the request did not receive a response within its timeout" &&
+    !inspect(error).includes(token) &&
+    !JSON.stringify(error).includes(token);
+
+  // Recovery and exhaustion share the clock: 1 s + 2 s and 1 s + 2 s + 4 s.
+  const [recovered] = await Promise.all([
+    client.getReview({ path: { org_id: orgId, review_id: "flaky" } }),
+    assert.rejects(
+      client.getReview({ path: { org_id: orgId, review_id: "gone" } }),
+      lost,
+    ),
+  ]);
+  assert.equal(recovered.id, "flaky");
+  const flaky = callsTo("flaky");
+  assert.equal(flaky.length, 3);
+  assert(flaky[1].at - flaky[0].at >= 900);
+  assert(flaky[2].at - flaky[1].at >= 1900);
+  const gone = callsTo("gone");
+  assert.equal(gone.length, 4);
+  assert(gone[3].at - gone[2].at >= 3900);
+  for (const call of [...flaky, ...gone]) {
+    assert.equal(call.method, "GET");
+    assert.equal(call.authorization, `Bearer ${token}`);
+  }
+
+  // Mutations may have been recorded before the connection dropped.
+  await assert.rejects(
+    client.rerunReview({ path: { org_id: orgId, review_id: "rerun-target" } }),
+    lost,
+  );
+  assert.equal(callsTo("rerun-target").length, 1);
+  await assert.rejects(
+    client.requestReview(
+      { path: { org_id: orgId, repo_id: "review-target", number: 12 } },
+      { mode: "FULL" },
+    ),
+    lost,
+  );
+  assert.equal(callsTo("review-target").length, 1);
+
+  // A read that ran out its own request timeout is not sent again.
+  const bounded = new ProoflineClient({
+    baseUrl: fixture.baseUrl,
+    token,
+    requestTimeoutMs: 50,
+  });
+  await assert.rejects(
+    bounded.getReview({ path: { org_id: orgId, review_id: "hanging" } }),
+    lost,
+  );
+  assert.equal(callsTo("hanging").length, 1);
+});
+
+test("a review wait survives a lost connection and never reports an unreachable server as TIMED_OUT", async (t) => {
+  let mode = "drop-once";
+  let drops = 0;
+  const fixture = await server(t, (_, response) => {
+    if (mode === "drop-always" || (mode === "drop-once" && drops === 0)) {
+      drops += 1;
+      return response.destroy();
+    }
+    return json(response, 200, review("COMPLETED"));
+  });
+  const client = new ProoflineClient({ baseUrl: fixture.baseUrl, token });
+  const completed = await client.waitForReview(orgId, reviewId, {
+    timeoutMs: 10_000,
+  });
+  assert.equal(completed.status, "COMPLETED");
+  assert.deepEqual(completed.gaps, []);
+  assert.equal(fixture.calls.length, 2);
+
+  // The second backoff (2 s) would cross the 1.5 s deadline, so the wait stops
+  // on the transport failure instead of sleeping past it or timing out.
+  mode = "drop-always";
+  const before = fixture.calls.length;
+  const started = performance.now();
+  await assert.rejects(
+    client.waitForReview(orgId, reviewId, { timeoutMs: 1_500 }),
+    (error) =>
+      error instanceof ProoflineError &&
+      error.status === 0 &&
+      error.type === "urn:proofline:sdk:transport",
+  );
+  assert.equal(fixture.calls.length - before, 2);
+  assert(performance.now() - started < 1_500);
+});
+
 const invalidUtf8Body = Buffer.concat([
   Buffer.from(`<html>${responseCanary} ${token}`),
   Buffer.from([0xff]),

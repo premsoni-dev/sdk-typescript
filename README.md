@@ -38,6 +38,12 @@ try {
 }
 ```
 
+## Retries
+
+Reads (`GET`) are retried at most three times, so a read makes at most four attempts. A 429 or 503 is retried after its `Retry-After` delay, or after 1, 2 and 4 seconds when the header is absent; a `Retry-After` longer than 60 seconds or one that cannot be read returns the problem at once. A read whose connection is lost before any response arrives, such as a reset or refused connection, is retried after 1, 2 and 4 seconds. A read that runs out its own `requestTimeoutMs` is not retried. Mutations, review requests and MCP tool calls make one attempt, because the server may have recorded them before the connection dropped. When the retries run out, a lost connection throws `ProoflineError` with status 0 and the type `urn:proofline:sdk:transport`.
+
+`waitForReview` uses the same retries for each poll and never sleeps past `timeoutMs`. When the next retry would cross it, a lost connection throws `urn:proofline:sdk:transport` instead of returning `TIMED_OUT`, so an unreachable server is not reported as a review that is still running.
+
 ## Coverage uploads
 
 Upload CI coverage reports with a repository-restricted token that holds `coverage:write`. The token holder must have current GitHub write access to that repository. Set `PROOFLINE_TOKEN` to that token and pass the full commit SHA that the tests ran on. The server refuses branch names and abbreviated SHAs.
